@@ -81,9 +81,14 @@ export interface RawScan {
  * discover the cursor stopped moving.
  */
 export function eventCursorLedger(cursor: string): number | null {
+  if (typeof cursor !== "string") return null;
   const toid = cursor.split("-")[0];
   if (!toid || !/^\d+$/.test(toid)) return null;
-  return Number(BigInt(toid) >> 32n);
+  try {
+    return Number(BigInt(toid) >> 32n);
+  } catch {
+    return null;
+  }
 }
 
 export async function paginatedGetEvents(
@@ -125,8 +130,9 @@ export async function paginatedGetEvents(
           limit,
         });
 
-    events.push(...response.events);
-    latestLedger = response.latestLedger;
+    const rawEvents = Array.isArray(response?.events) ? response.events : [];
+    events.push(...rawEvents);
+    latestLedger = response?.latestLedger ?? latestLedger;
 
     const nextCursor = response.cursor || "";
     // Out of cursor, or the server stopped moving: nothing left to read.
