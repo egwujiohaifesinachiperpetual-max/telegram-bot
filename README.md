@@ -87,6 +87,7 @@ looks healthy but notifies nobody.
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
 | `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/health` | Health assessment and operational readiness (status, uptime, consecutive failures, poll freshness) |
 
 ## Reading events without a bot token
 
@@ -203,7 +204,7 @@ src/
   index.ts                 entry point: config -> RPC -> bot -> poller -> health HTTP
   health.ts                local loopback GET /health for supervisors
   config.ts                env loading and validation, fails fast
-  bot.ts                   grammy setup: /start, /help, /status
+  bot.ts                   grammy setup: /start, /help, /status, /health
   poller.ts                the loop: scan, notify, persist the cursor
   stellar/
     client.ts              Soroban RPC client + explorer links

@@ -15,18 +15,25 @@ Operational guidance for recovering the Mimir Telegram notifier from missed noti
 Run:
 
 ```bash
+/health
+```
+
+Or for full poller state details:
+
+```bash
 /status
 ```
 
 Check:
 
+* overall readiness and status (`ok`, `degraded`, `stopped`)
 * current chain tip
 * RPC retained-history floor
 * watched contract IDs
 * last event ledger per contract
 * persisted cursor
 * poll/send counters
-* last error
+* last error and consecutive failure count
 
 For a read-only chain diagnostic without a Telegram token:
 
