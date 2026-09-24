@@ -1,14 +1,16 @@
 /**
  * The grammy bot: commands, and the one send path the poller uses.
  *
- * The bot half is deliberately thin. It answers four commands and exposes
- * `notify()`; all chain logic lives in `src/poller.ts` and `src/stellar/`.
+ * The bot half is deliberately thin. It answers a handful of commands and
+ * exposes `notify()`; all chain logic lives in `src/poller.ts` and
+ * `src/stellar/`.
  */
 
 import { Bot } from "grammy";
 
 import { escapeMd } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
+import { contractExplorerUrl } from "./stellar/client.js";
 import type { PollerStatus } from "./poller.js";
 import { buildHealthReport } from "./health.js";
 
@@ -18,7 +20,7 @@ const HELP = [
   "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
   "",
   "/status — what I am watching and how far I have read",
-  "/health — health assessment and operational readiness",
+  "/contracts — the contract ids I watch and where to look them up",
   "/help — this message",
 ].join("\n");
 
@@ -64,47 +66,31 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
   return lines.join("\n");
 }
 
-export function healthMessage(
-  config: BotConfig,
-  status: PollerStatus,
-  nowMs: number = Date.now(),
-): string {
-  const report = buildHealthReport(config, status, nowMs);
-  const statusLabel = report.status.toUpperCase();
-
-  const lines: string[] = [
-    `*Health* — ${escapeMd(statusLabel)} on Stellar ${networkLabel(config)}`,
-    "",
-    `Status: \`${report.status}\` \\(${report.ok ? "ok" : "action required"}\\)`,
-    `Poller: ${report.poller.running ? "running" : "stopped"}`,
-    `Uptime: ${report.uptimeMs > 0 ? ago(nowMs - report.uptimeMs, nowMs) : "0s"}`,
-    `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
-    `Last successful poll: ${ago(status.lastSuccessAt, nowMs)}`,
-    `Chain tip: ${report.poller.latestLedger ?? "unknown"}`,
-    `Cycles: ${report.poller.cycles} · consecutive failures: ${report.poller.consecutiveFailures}`,
-    `Notifications: sent ${report.poller.notificationsSent} · failed ${report.poller.notificationsFailed} · skipped ${report.poller.eventsSkipped}`,
-    "",
-    "*Watched Contracts*",
+/**
+ * The `/contracts` message: which two contracts this bot watches, and where to
+ * look each one up independently — deliberately static (config only, no
+ * poller state), so it answers the same whether the poller is mid-cycle,
+ * between restarts, or wedged on a run of RPC failures. `/status` is for
+ * "is it working"; this is for "what is it even watching".
+ */
+export function contractsMessage(config: BotConfig): string {
+  const targets: Array<{ label: string; contractId: string }> = [
+    { label: "mimir\\-market", contractId: config.marketContractId },
+    { label: "mimir\\-squad", contractId: config.squadContractId },
   ];
 
-  for (const target of report.poller.targets) {
-    lines.push(
-      `· mimir\\-${target.source} \`${target.contractId}\``,
-      `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
-      `  cursor: \`${target.cursorPreview ?? "none (cold start)"}\``,
-    );
-    if (target.hasError) {
-      const targetState = status.targets.find((t) => t.source === target.source);
-      if (targetState?.lastError) {
-        lines.push(`  last error: ${escapeMd(targetState.lastError)}`);
-      }
-    }
-  }
+  const lines: string[] = [
+    `*Contracts* — Mimir on Stellar ${escapeMd(networkLabel(config))}`,
+    "",
+    "Read\\-only: this bot holds no signing keys and cannot submit transactions\\.",
+  ];
 
-  if (report.poller.lastError) {
+  for (const target of targets) {
     lines.push(
       "",
-      `Last error \\(${ago(status.lastError?.at ?? null, nowMs)}\\): ${escapeMd(report.poller.lastError.message)}`,
+      `*${target.label}*`,
+      `\`${escapeMd(target.contractId)}\``,
+      `[View on stellar\\.expert](${contractExplorerUrl(config, target.contractId)})`,
     );
   }
 
@@ -135,8 +121,10 @@ export function createBot(deps: BotDeps): Bot {
     });
   });
 
-  bot.command("health", async (ctx) => {
-    await ctx.reply(healthMessage(config, status()), {
+  // Config-only, so this never fails on account of poller or RPC state —
+  // unlike /status, it has nothing to report failure on.
+  bot.command("contracts", async (ctx) => {
+    await ctx.reply(contractsMessage(config), {
       parse_mode: "MarkdownV2",
       link_preview_options: { is_disabled: true },
     });
@@ -168,7 +156,7 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "start", description: "What this bot does" },
       { command: "help", description: "Show help" },
       { command: "status", description: "Last-seen ledger and watched contracts" },
-      { command: "health", description: "Health assessment and operational readiness" },
+      { command: "contracts", description: "Contract ids and explorer links" },
     ]);
   } catch (err) {
     // Cosmetic. Never worth failing a boot over.
