@@ -11,14 +11,25 @@ import { escapeMd } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
 
-const HELP = [
-  "*Mimir notifier*",
-  "",
-  "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
-  "",
-  "/status — what I am watching and how far I have read",
-  "/help — this message",
-].join("\n");
+export const BOT_COMMANDS = [
+  { command: "start", description: "What this bot does" },
+  { command: "help", description: "Show help" },
+  { command: "status", description: "Last-seen ledger and watched contracts" },
+];
+
+export function helpMessage(): string {
+  const lines = [
+    "*Mimir notifier*",
+    "",
+    "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
+    "",
+  ];
+  for (const cmd of BOT_COMMANDS) {
+    if (cmd.command === "start") continue;
+    lines.push(`/${cmd.command} — ${escapeMd(cmd.description)}`);
+  }
+  return lines.join("\n");
+}
 
 function ago(timestamp: number | null): string {
   if (timestamp === null) return "never";
@@ -72,11 +83,11 @@ export function createBot(deps: BotDeps): Bot {
   const bot = new Bot(config.botToken);
 
   bot.command("start", async (ctx) => {
-    await ctx.reply(HELP, { parse_mode: "MarkdownV2" });
+    await ctx.reply(helpMessage(), { parse_mode: "MarkdownV2" });
   });
 
   bot.command("help", async (ctx) => {
-    await ctx.reply(HELP, { parse_mode: "MarkdownV2" });
+    await ctx.reply(helpMessage(), { parse_mode: "MarkdownV2" });
   });
 
   bot.command("status", async (ctx) => {
@@ -108,11 +119,7 @@ export function createNotifier(bot: Bot, config: BotConfig) {
 /** Registers the command list so Telegram's UI offers autocompletion. */
 export async function registerCommands(bot: Bot): Promise<void> {
   try {
-    await bot.api.setMyCommands([
-      { command: "start", description: "What this bot does" },
-      { command: "help", description: "Show help" },
-      { command: "status", description: "Last-seen ledger and watched contracts" },
-    ]);
+    await bot.api.setMyCommands(BOT_COMMANDS);
   } catch (err) {
     // Cosmetic. Never worth failing a boot over.
     console.warn(`[bot] setMyCommands failed: ${err instanceof Error ? err.message : err}`);
