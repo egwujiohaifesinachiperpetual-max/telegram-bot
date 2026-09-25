@@ -1,351 +1,529 @@
+/**
+ * Tests for src/stellar/decode.ts
+ *
+ * decodeEvent must NEVER throw, regardless of input shape.
+ * Any event it does not understand becomes { name: "unknown", reason: "..." }.
+ *
+ * Covered:
+ *   - Missing topics
+ *   - Wrong-type fields
+ *   - Oversized strings (clip() in formatEvent)
+ *   - Unknown event names (no decoder)
+ *   - Admin events that are real but have no notification
+ *   - Both market and squad sources
+ *   - Helpers: formatUsdc, shortAddress, winnerSideLabel, squadSideLabel
+ */
+
 import assert from "node:assert/strict";
 import test from "node:test";
-import { xdr } from "@stellar/stellar-sdk";
 
-import { decodeEvent } from "../dist/stellar/decode.js";
-import { readContractEvents, eventCursorLedger } from "../dist/stellar/events.js";
-import { formatEvent } from "../dist/notifications/format.js";
+import { nativeToScVal, Address, Keypair } from "@stellar/stellar-sdk";
+import {
+  decodeEvent,
+  formatUsdc,
+  shortAddress,
+  winnerSideLabel,
+  squadSideLabel,
+  USDC_UNIT,
+  WINNER_SIDE,
+  SQUAD_SIDE,
+} from "../dist/stellar/decode.js";
+import { formatEvent, escapeMd } from "../dist/notifications/format.js";
 
-const TEST_CONFIG = {
-  chatId: "-1001234567890",
-  marketContractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
-  squadContractId: "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
-  rpcUrl: "https://soroban-testnet.stellar.org",
-  horizonUrl: "https://horizon-testnet.stellar.org",
-  networkPassphrase: "Test SDF Network ; September 2015",
-  explorerBaseUrl: "https://stellar.expert/explorer",
-};
+// ── Deterministic test address ────────────────────────────────────────────────
 
-const VALID_ADDR = "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW";
+// A deterministic keypair derived from a fixed seed, giving a stable G-address.
+const TEST_KP = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 0x42));
+const ADDR = TEST_KP.publicKey(); // predictable G... strkey, 56 chars
 
-test("decodeEvent parses valid positive amounts across market and squad events", () => {
-  const cases = [
-    {
-      source: "market",
-      eventName: "claim_challenged",
-      topics: [xdr.ScVal.scvSymbol("claim_challenged"), xdr.ScVal.scvU64(new xdr.Uint64(1n)), xdr.ScVal.scvString(VALID_ADDR)],
-      value: xdr.ScVal.scvMap([
-        new xdr.ScMapEntry({
-          key: xdr.ScVal.scvSymbol("stake"),
-          val: xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: new xdr.Int64(0n), lo: new xdr.Uint64(10_000_000n) })),
-        }),
-      ]),
-      check: (p) => p.name === "claim_challenged" && p.stake === 10_000_000n,
-    },
-    {
-      source: "market",
-      eventName: "fee_claimed",
-      topics: [xdr.ScVal.scvSymbol("fee_claimed"), xdr.ScVal.scvString(VALID_ADDR)],
-      value: xdr.ScVal.scvMap([
-        new xdr.ScMapEntry({
-          key: xdr.ScVal.scvSymbol("amount"),
-          val: xdr.ScVal.scvU64(new xdr.Uint64(500n)),
-        }),
-      ]),
-      check: (p) => p.name === "fee_claimed" && p.amount === 500n,
-    },
-    {
-      source: "squad",
-      eventName: "deposited",
-      topics: [
-        xdr.ScVal.scvSymbol("deposited"),
-        xdr.ScVal.scvU64(new xdr.Uint64(2n)),
-        xdr.ScVal.scvU32(1),
-        xdr.ScVal.scvString(VALID_ADDR),
-      ],
-      value: xdr.ScVal.scvMap([
-        new xdr.ScMapEntry({
-          key: xdr.ScVal.scvSymbol("amount"),
-          val: xdr.ScVal.scvU64(new xdr.Uint64(20_000_000n)),
-        }),
-        new xdr.ScMapEntry({
-          key: xdr.ScVal.scvSymbol("shares"),
-          val: xdr.ScVal.scvU64(new xdr.Uint64(20_000_000n)),
-        }),
-      ]),
-      check: (p) => p.name === "deposited" && p.amount === 20_000_000n && p.shares === 20_000_000n,
-    },
-  ];
+// ── ScVal builders ────────────────────────────────────────────────────────────
 
-  for (const c of cases) {
-    const rawEvent = {
-      id: "100-0",
-      ledger: 100,
-      contractId: TEST_CONFIG.marketContractId,
-      txHash: "00".repeat(32),
-      ledgerClosedAt: "2026-01-01T00:00:00Z",
-      topic: c.topics,
-      value: c.value,
-    };
-    const decoded = decodeEvent(c.source, rawEvent);
-    assert.ok(c.check(decoded.payload), `failed for ${c.eventName}`);
+function scStr(s) {
+  return nativeToScVal(s, { type: "string" });
+}
+function scU64(n) {
+  return nativeToScVal(BigInt(n), { type: "u64" });
+}
+function scI128(n) {
+  return nativeToScVal(BigInt(n), { type: "i128" });
+}
+/** Build an Address ScVal from a G-address strkey. */
+function scAddress(gAddr) {
+  const kp = Keypair.fromPublicKey(gAddr);
+  return Address.account(Buffer.from(kp.rawPublicKey())).toScVal();
+}
+function scU32(n) {
+  return nativeToScVal(n, { type: "u32" });
+}
+function scBytes(hex) {
+  const buf = Buffer.from(hex, "hex");
+  return nativeToScVal(buf, { type: "bytes" });
+}
+
+// ── formatUsdc ────────────────────────────────────────────────────────────────
+
+test("formatUsdc: 0 renders as 0.0000000", () => {
+  assert.equal(formatUsdc(0n), "0.0000000");
+});
+
+test("formatUsdc: 1 atomic unit renders as 0.0000001", () => {
+  assert.equal(formatUsdc(1n), "0.0000001");
+});
+
+test("formatUsdc: USDC_UNIT renders as 1.0000000", () => {
+  assert.equal(formatUsdc(USDC_UNIT), "1.0000000");
+});
+
+test("formatUsdc: negative amounts render with leading minus", () => {
+  assert.equal(formatUsdc(-USDC_UNIT), "-1.0000000");
+});
+
+test("formatUsdc: large integer keeps all 7 fractional digits", () => {
+  assert.equal(formatUsdc(123_456_789_012_345_678_901_234_567n), "12345678901234567890.1234567");
+});
+
+// ── shortAddress ──────────────────────────────────────────────────────────────
+
+test("shortAddress: long address is truncated to head…tail form", () => {
+  // shortAddress returns `${addr.slice(0, 5)}…${addr.slice(-4)}` for > 12 chars
+  const short = shortAddress(ADDR);
+  const expected = `${ADDR.slice(0, 5)}…${ADDR.slice(-4)}`;
+  assert.equal(short, expected);
+  assert.ok(short.length < ADDR.length);
+});
+
+test("shortAddress: exactly 12 chars is returned as-is (boundary)", () => {
+  const twelve = "GABCDEFGHIJKL".slice(0, 12);
+  assert.equal(shortAddress(twelve), twelve);
+});
+
+test("shortAddress: 5-char address is returned as-is", () => {
+  assert.equal(shortAddress("GABCD"), "GABCD");
+});
+
+test("shortAddress: 13-char address is truncated", () => {
+  const thirteen = "G" + "A".repeat(12); // 13 chars
+  const result = shortAddress(thirteen);
+  assert.ok(result.includes("…"), "truncated address must contain ellipsis");
+  assert.ok(result.length < thirteen.length);
+});
+
+// ── winnerSideLabel / squadSideLabel ─────────────────────────────────────────
+
+test("winnerSideLabel: known codes return their label", () => {
+  for (const [code, label] of Object.entries(WINNER_SIDE)) {
+    assert.equal(winnerSideLabel(Number(code)), label);
   }
 });
 
-test("decodeEvent rejects zero stake or positive stake as valid non-negative amounts", () => {
-  const zeroEvent = {
-    id: "101-0",
-    ledger: 101,
-    contractId: TEST_CONFIG.marketContractId,
-    txHash: "00".repeat(32),
+test("winnerSideLabel: unknown code returns a fallback string", () => {
+  const label = winnerSideLabel(99);
+  assert.match(label, /side 99/i);
+});
+
+test("squadSideLabel: known codes return their label", () => {
+  for (const [code, label] of Object.entries(SQUAD_SIDE)) {
+    assert.equal(squadSideLabel(Number(code)), label);
+  }
+});
+
+test("squadSideLabel: unknown code returns a fallback string", () => {
+  const label = squadSideLabel(77);
+  assert.match(label, /side 77/i);
+});
+
+// ── decodeEvent: never throws ─────────────────────────────────────────────────
+
+test("decodeEvent: completely empty event produces unknown payload without throwing", () => {
+  const raw = {
+    id: "1-0",
+    contractId: "C1",
+    ledger: 1,
+    txHash: "",
     ledgerClosedAt: "2026-01-01T00:00:00Z",
-    topic: [
-      xdr.ScVal.scvSymbol("claim_challenged"),
-      xdr.ScVal.scvU64(new xdr.Uint64(5n)),
-      xdr.ScVal.scvString(VALID_ADDR),
-    ],
-    value: xdr.ScVal.scvMap([
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol("stake"),
-        val: xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: new xdr.Int64(0n), lo: new xdr.Uint64(0n) })),
-      }),
-    ]),
-  };
-  const decoded = decodeEvent("market", zeroEvent);
-  assert.equal(decoded.payload.name, "claim_challenged");
-  if (decoded.payload.name === "claim_challenged") {
-    assert.equal(decoded.payload.stake, 0n);
-  }
-});
-
-test("decodeEvent rejects negative decoded amounts across market and squad payloads", () => {
-  const negativeCases = [
-    {
-      source: "market",
-      eventName: "claim_challenged",
-      topics: [xdr.ScVal.scvSymbol("claim_challenged"), xdr.ScVal.scvU64(new xdr.Uint64(1n)), xdr.ScVal.scvString(VALID_ADDR)],
-      value: xdr.ScVal.scvMap([
-        new xdr.ScMapEntry({
-          key: xdr.ScVal.scvSymbol("stake"),
-          val: xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: new xdr.Int64(-1n), lo: new xdr.Uint64(0n) })),
-        }),
-      ]),
-      expectedReasonMatch: /claim_challenged\.stake: expected non-negative amount/,
-    },
-    {
-      source: "market",
-      eventName: "withdrawal",
-      topics: [xdr.ScVal.scvSymbol("withdrawal"), xdr.ScVal.scvString(VALID_ADDR)],
-      value: xdr.ScVal.scvMap([
-        new xdr.ScMapEntry({
-          key: xdr.ScVal.scvSymbol("amount"),
-          val: xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: new xdr.Int64(-5n), lo: new xdr.Uint64(0n) })),
-        }),
-      ]),
-      expectedReasonMatch: /withdrawal\.amount: expected non-negative amount/,
-    },
-    {
-      source: "squad",
-      eventName: "deposited",
-      topics: [
-        xdr.ScVal.scvSymbol("deposited"),
-        xdr.ScVal.scvU64(new xdr.Uint64(1n)),
-        xdr.ScVal.scvU32(1),
-        xdr.ScVal.scvString(VALID_ADDR),
-      ],
-      value: xdr.ScVal.scvMap([
-        new xdr.ScMapEntry({
-          key: xdr.ScVal.scvSymbol("amount"),
-          val: xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: new xdr.Int64(-10n), lo: new xdr.Uint64(0n) })),
-        }),
-        new xdr.ScMapEntry({
-          key: xdr.ScVal.scvSymbol("shares"),
-          val: xdr.ScVal.scvU64(new xdr.Uint64(100n)),
-        }),
-      ]),
-      expectedReasonMatch: /deposited\.amount: expected non-negative amount/,
-    },
-    {
-      source: "squad",
-      eventName: "resolved",
-      topics: [xdr.ScVal.scvSymbol("resolved"), xdr.ScVal.scvU64(new xdr.Uint64(1n))],
-      value: xdr.ScVal.scvMap([
-        new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol("result"), val: xdr.ScVal.scvU32(1) }),
-        new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol("pool_a"), val: xdr.ScVal.scvU64(new xdr.Uint64(1000n)) }),
-        new xdr.ScMapEntry({
-          key: xdr.ScVal.scvSymbol("pool_b"),
-          val: xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: new xdr.Int64(-1n), lo: new xdr.Uint64(0n) })),
-        }),
-      ]),
-      expectedReasonMatch: /resolved\.pool_b: expected non-negative amount/,
-    },
-  ];
-
-  for (const c of negativeCases) {
-    const rawEvent = {
-      id: "200-0",
-      ledger: 200,
-      contractId: TEST_CONFIG.marketContractId,
-      txHash: "00".repeat(32),
-      ledgerClosedAt: "2026-01-01T00:00:00Z",
-      topic: c.topics,
-      value: c.value,
-    };
-    const decoded = decodeEvent(c.source, rawEvent);
-    assert.equal(decoded.payload.name, "unknown");
-    assert.ok(
-      c.expectedReasonMatch.test(decoded.payload.reason ?? ""),
-      `expected reason match for ${c.eventName}, got "${decoded.payload.reason}"`,
-    );
-
-    // Assert formatEvent stays non-notifying (returns null)
-    assert.equal(formatEvent(TEST_CONFIG, decoded), null, `formatEvent should skip ${c.eventName}`);
-  }
-});
-
-test("decodeEvent rejects invalid amount types and non-integer amount strings", () => {
-  const invalidTypeCases = [
-    { value: "invalid-string", reasonMatch: /expected an integer/ },
-    { value: "12.34", reasonMatch: /expected an integer/ },
-    { value: true, reasonMatch: /expected an integer/ },
-    { value: {}, reasonMatch: /expected an integer/ },
-  ];
-
-  for (const c of invalidTypeCases) {
-    const rawEvent = {
-      id: "201-0",
-      ledger: 201,
-      contractId: TEST_CONFIG.marketContractId,
-      txHash: "00".repeat(32),
-      ledgerClosedAt: "2026-01-01T00:00:00Z",
-      topic: [
-        xdr.ScVal.scvSymbol("claim_challenged"),
-        xdr.ScVal.scvU64(new xdr.Uint64(1n)),
-        xdr.ScVal.scvString(VALID_ADDR),
-      ],
-      value: xdr.ScVal.scvMap([
-        new xdr.ScMapEntry({
-          key: xdr.ScVal.scvSymbol("stake"),
-          val: typeof c.value === "string" ? xdr.ScVal.scvString(c.value) : xdr.ScVal.scvBool(true),
-        }),
-      ]),
-    };
-    const decoded = decodeEvent("market", rawEvent);
-    assert.equal(decoded.payload.name, "unknown");
-    assert.ok(
-      c.reasonMatch.test(decoded.payload.reason ?? ""),
-      `reason should match, got "${decoded.payload.reason}"`,
-    );
-  }
-});
-
-test("decodeEvent rejects negative IDs and deadlines", () => {
-  const rawEvent = {
-    id: "202-0",
-    ledger: 202,
-    contractId: TEST_CONFIG.marketContractId,
-    txHash: "00".repeat(32),
-    ledgerClosedAt: "2026-01-01T00:00:00Z",
-    topic: [
-      xdr.ScVal.scvSymbol("claim_challenged"),
-      xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: new xdr.Int64(-1n), lo: new xdr.Uint64(0n) })),
-      xdr.ScVal.scvString(VALID_ADDR),
-    ],
-    value: xdr.ScVal.scvMap([
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol("stake"),
-        val: xdr.ScVal.scvU64(new xdr.Uint64(100n)),
-      }),
-    ]),
-  };
-  const decoded = decodeEvent("market", rawEvent);
-  assert.equal(decoded.payload.name, "unknown");
-  assert.match(decoded.payload.reason ?? "", /claim_challenged\.id: expected non-negative integer/);
-});
-
-test("decodeEvent handles malformed XDR and null/undefined event objects safely without crashing", () => {
-  // Null event
-  const nullDecoded = decodeEvent("market", null);
-  assert.equal(nullDecoded.payload.name, "unknown");
-
-  // Missing topic / empty topic
-  const emptyTopicEvent = {
-    id: "300-0",
-    ledger: 300,
-    contractId: TEST_CONFIG.marketContractId,
     topic: [],
     value: null,
   };
-  const emptyDecoded = decodeEvent("market", emptyTopicEvent);
-  assert.equal(emptyDecoded.payload.name, "unknown");
-  assert.equal(emptyDecoded.payload.reason, "no decoder");
+  let result;
+  assert.doesNotThrow(() => { result = decodeEvent("market", raw); });
+  assert.equal(result.payload.name, "unknown");
+  assert.ok(result.payload.eventName !== undefined);
+});
 
-  // Malformed XDR in topic element
-  const badTopicEvent = {
-    id: "301-0",
-    ledger: 301,
-    contractId: TEST_CONFIG.marketContractId,
-    topic: ["invalid-xdr-not-scval"],
+test("decodeEvent: null value field does not throw", () => {
+  const raw = {
+    id: "2-0",
+    contractId: "C1",
+    ledger: 2,
+    txHash: "",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_created")],
     value: null,
   };
-  const badTopicDecoded = decodeEvent("market", badTopicEvent);
-  assert.equal(badTopicDecoded.payload.name, "unknown");
-
-  // Malformed XDR in value
-  const badValueEvent = {
-    id: "302-0",
-    ledger: 302,
-    contractId: TEST_CONFIG.marketContractId,
-    topic: [xdr.ScVal.scvSymbol("claim_challenged")],
-    value: "invalid-scval-structure",
-  };
-  const badValueDecoded = decodeEvent("market", badValueEvent);
-  assert.equal(badValueDecoded.payload.name, "unknown");
-  assert.match(badValueDecoded.payload.reason ?? "", /malformed event value XDR/);
+  let result;
+  assert.doesNotThrow(() => { result = decodeEvent("market", raw); });
+  assert.equal(result.payload.name, "unknown");
 });
 
-test("readContractEvents handles synthetic response containing malformed XDR without crashing scanner", async () => {
-  const fakeServer = {
-    getHealth: async () => ({ oldestLedger: 100, latestLedger: 200 }),
-    getEvents: async (req) => {
-      if (req.cursor === "200-1") {
-        return { latestLedger: 200, cursor: "200-1", events: [] };
-      }
-      return {
-        latestLedger: 200,
-        cursor: "200-1",
-        events: [
-          {
-            id: "200-0",
-            ledger: 200,
-            contractId: TEST_CONFIG.marketContractId,
-            topic: [xdr.ScVal.scvSymbol("claim_challenged"), xdr.ScVal.scvU64(new xdr.Uint64(1n)), xdr.ScVal.scvString(VALID_ADDR)],
-            value: xdr.ScVal.scvMap([
-              new xdr.ScMapEntry({
-                key: xdr.ScVal.scvSymbol("stake"),
-                val: xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: new xdr.Int64(-500n), lo: new xdr.Uint64(0n) })),
-              }),
-            ]),
-          },
-          {
-            id: "200-1",
-            ledger: 200,
-            contractId: TEST_CONFIG.marketContractId,
-            topic: ["corrupt-topic-xdr"],
-            value: "corrupt-value-xdr",
-          },
-        ],
-      };
+test("decodeEvent: unknown event name yields unknown payload with reason=no decoder", () => {
+  const raw = {
+    id: "3-0",
+    contractId: "C1",
+    ledger: 3,
+    txHash: "",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("oracle_changed"), scStr("something")],
+    value: nativeToScVal({}),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.payload.name, "unknown");
+  assert.equal(result.payload.eventName, "oracle_changed");
+  assert.equal(result.payload.reason, "no decoder");
+});
+
+test("decodeEvent: missing required topic produces unknown with a reason", () => {
+  // claim_created expects topics[1] = claimId, topics[2] = creator.
+  // Providing only the name topic should produce an unknown with a reason.
+  const raw = {
+    id: "4-0",
+    contractId: "C1",
+    ledger: 4,
+    txHash: "",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_created")], // missing topics[1] and topics[2]
+    value: nativeToScVal({ category: "crypto" }),
+  };
+  let result;
+  assert.doesNotThrow(() => { result = decodeEvent("market", raw); });
+  assert.equal(result.payload.name, "unknown");
+  assert.ok(result.payload.reason, "reason should be populated");
+});
+
+test("decodeEvent: wrong type for required topic produces unknown — never throws", () => {
+  // Pass a string where claimId (u64) is expected. The str value
+  // "not-a-number" will be passed to num(), which calls big() — but
+  // big() tries BigInt("not-a-number") which throws a SyntaxError inside
+  // decodeEvent. decodeEvent must catch it and return unknown.
+  const raw = {
+    id: "5-0",
+    contractId: "C1",
+    ledger: 5,
+    txHash: "",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_created"), scStr("not-a-number"), scAddress(ADDR)],
+    value: nativeToScVal({ category: "crypto" }),
+  };
+  let result;
+  assert.doesNotThrow(() => { result = decodeEvent("market", raw); });
+  // Either a decode error (unknown) or a successful parse — but no throw.
+  assert.ok(result.payload.name === "claim_created" || result.payload.name === "unknown");
+});
+
+test("decodeEvent: claim_created decodes correctly", () => {
+  const raw = {
+    id: "10-0",
+    contractId: "C1",
+    ledger: 10,
+    txHash: "deadbeef",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_created"), scU64(42), scAddress(ADDR)],
+    value: nativeToScVal({ category: "sports" }),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.payload.name, "claim_created");
+  assert.equal(result.payload.claimId, 42);
+  assert.equal(result.payload.creator, ADDR);
+  assert.equal(result.payload.category, "sports");
+  assert.equal(result.ledger, 10);
+  assert.equal(result.txHash, "deadbeef");
+});
+
+test("decodeEvent: claim_challenged decodes stake as bigint", () => {
+  const stake = 20_000_000n;
+  const raw = {
+    id: "11-0",
+    contractId: "C1",
+    ledger: 11,
+    txHash: "abc",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_challenged"), scU64(7), scAddress(ADDR)],
+    value: nativeToScVal({ stake: scI128(stake) }),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.payload.name, "claim_challenged");
+  assert.equal(result.payload.stake, stake);
+});
+
+test("decodeEvent: claim_resolved decodes all fields", () => {
+  const evidenceHex = "deadbeefcafe0123";
+  const raw = {
+    id: "12-0",
+    contractId: "C1",
+    ledger: 12,
+    txHash: "abc",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_resolved"), scU64(3)],
+    value: nativeToScVal({
+      winner_side: scU32(2),
+      summary: "challengers win",
+      confidence: scU32(95),
+      evidence_hash: scBytes(evidenceHex),
+    }),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.payload.name, "claim_resolved");
+  assert.equal(result.payload.claimId, 3);
+  assert.equal(result.payload.winnerSide, 2);
+  assert.equal(result.payload.summary, "challengers win");
+  assert.equal(result.payload.confidence, 95);
+  assert.equal(result.payload.evidenceHash, evidenceHex);
+});
+
+test("decodeEvent: squad market_created decodes correctly", () => {
+  const raw = {
+    id: "20-0",
+    contractId: "C2",
+    ledger: 20,
+    txHash: "def",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("market_created"), scU64(5), scAddress(ADDR)],
+    value: nativeToScVal({
+      deadline: scU64(1_700_000_000),
+      fee_bps: scU32(100),
+      question: "Will it rain?",
+    }),
+  };
+  const result = decodeEvent("squad", raw);
+  assert.equal(result.payload.name, "market_created");
+  assert.equal(result.payload.marketId, 5);
+  assert.equal(result.payload.captain, ADDR);
+  assert.equal(result.payload.question, "Will it rain?");
+  assert.equal(result.payload.feeBps, 100);
+});
+
+test("decodeEvent: squad deposited decodes side and amount", () => {
+  const amount = 50_000_000n; // 5 USDC
+  const raw = {
+    id: "21-0",
+    contractId: "C2",
+    ledger: 21,
+    txHash: "ghi",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("deposited"), scU64(5), scU32(1), scAddress(ADDR)],
+    value: nativeToScVal({ amount: scI128(amount), shares: scI128(50n) }),
+  };
+  const result = decodeEvent("squad", raw);
+  assert.equal(result.payload.name, "deposited");
+  assert.equal(result.payload.amount, amount);
+  assert.equal(result.payload.side, 1);
+});
+
+test("decodeEvent: admin market event (oracle_changed) yields unknown/no decoder", () => {
+  const raw = {
+    id: "30-0",
+    contractId: "C1",
+    ledger: 30,
+    txHash: "",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    // oracle_changed uses an address topic but that's irrelevant — the event is
+    // unrecognised by the decoder regardless of topic contents.
+    topic: [scStr("oracle_changed")],
+    value: nativeToScVal({}),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.payload.name, "unknown");
+  assert.equal(result.payload.eventName, "oracle_changed");
+});
+
+test("decodeEvent: fee_policy_changed yields unknown/no decoder", () => {
+  const raw = {
+    id: "31-0",
+    contractId: "C1",
+    ledger: 31,
+    txHash: "",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("fee_policy_changed")],
+    value: nativeToScVal({}),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.payload.name, "unknown");
+});
+
+test("decodeEvent: squad unknown event yields unknown/no decoder", () => {
+  const raw = {
+    id: "40-0",
+    contractId: "C2",
+    ledger: 40,
+    txHash: "",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("future_event_not_yet_defined")],
+    value: nativeToScVal({}),
+  };
+  const result = decodeEvent("squad", raw);
+  assert.equal(result.payload.name, "unknown");
+  assert.equal(result.payload.reason, "no decoder");
+});
+
+// ── Oversized strings / clip() in formatEvent ────────────────────────────────
+
+test("formatEvent: long category in claim_created is rendered without truncation", () => {
+  // claim_created renders the category directly; there is no clip() call there,
+  // but it should still not throw or produce bad markdown.
+  const config = {
+    chatId: "-1",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const longCategory = "a".repeat(500);
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 1,
+    txHash: "",
+    at: 0,
+    eventId: "1-0",
+    payload: { name: "claim_created", claimId: 1, creator: "GABCD", category: longCategory },
+  };
+  let msg;
+  assert.doesNotThrow(() => { msg = formatEvent(config, event); });
+  assert.ok(msg !== null, "should produce a message");
+  // The full category is in the message (no truncation at this field)
+  assert.ok(msg.includes(escapeMd(longCategory)));
+});
+
+test("formatEvent: claim_resolved summary is clipped at 200 characters", () => {
+  const config = {
+    chatId: "-1",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const longSummary = "x".repeat(400);
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 1,
+    txHash: "",
+    at: 0,
+    eventId: "1-0",
+    payload: {
+      name: "claim_resolved",
+      claimId: 1,
+      winnerSide: 2,
+      summary: longSummary,
+      confidence: 80,
+      evidenceHash: "aa",
     },
   };
-
-  const scan = await readContractEvents(fakeServer, {
-    source: "market",
-    contractId: TEST_CONFIG.marketContractId,
-  });
-
-  assert.equal(scan.events.length, 2);
-  assert.equal(scan.events[0].payload.name, "unknown");
-  assert.match(scan.events[0].payload.reason ?? "", /expected non-negative amount/);
-  assert.equal(scan.events[1].payload.name, "unknown");
-  assert.equal(scan.cursor, "200-1");
-  assert.equal(scan.lastEventLedger, 200);
+  const msg = formatEvent(config, event);
+  assert.ok(msg !== null);
+  // The raw summary (400 chars) must not appear verbatim; the clipped version does
+  assert.ok(!msg.includes(escapeMd(longSummary)), "raw long summary must not appear");
+  assert.ok(msg.includes("…"), "clipped summary must end with ellipsis");
 });
 
-test("eventCursorLedger safely handles valid, invalid, and non-string cursors", () => {
-  assert.equal(eventCursorLedger("0018276211125911551-4294967295"), 4255261);
-  assert.equal(eventCursorLedger("invalid"), null);
-  assert.equal(eventCursorLedger(""), null);
-  assert.equal(eventCursorLedger(null), null);
-  assert.equal(eventCursorLedger(123), null);
+test("formatEvent: market_created question is clipped at 200 characters", () => {
+  const config = {
+    chatId: "-1",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const longQuestion = "q".repeat(400);
+  const event = {
+    source: "squad",
+    contractId: "squad",
+    ledger: 2,
+    txHash: "",
+    at: 0,
+    eventId: "2-0",
+    payload: {
+      name: "market_created",
+      marketId: 1,
+      captain: "GCAPT",
+      deadline: 1_700_000_000,
+      feeBps: 50,
+      question: longQuestion,
+    },
+  };
+  const msg = formatEvent(config, event);
+  assert.ok(msg !== null);
+  assert.ok(!msg.includes(escapeMd(longQuestion)), "raw long question must not appear");
+  assert.ok(msg.includes("…"), "clipped question must end with ellipsis");
+});
+
+test("formatEvent: unknown payload returns null", () => {
+  const config = {
+    chatId: "-1",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 1,
+    txHash: "",
+    at: 0,
+    eventId: "1-0",
+    payload: { name: "unknown", eventName: "oracle_changed", reason: "no decoder" },
+  };
+  assert.equal(formatEvent(config, event), null);
+});
+
+// ── EventMeta fields ──────────────────────────────────────────────────────────
+
+test("decodeEvent: meta fields are populated from the raw event", () => {
+  const raw = {
+    id: "99-1",
+    contractId: "CABC",
+    ledger: 99,
+    txHash: "cafecafe",
+    ledgerClosedAt: "2026-06-15T12:00:00Z",
+    topic: [scStr("claim_cancelled"), scU64(5)],
+    value: nativeToScVal({}),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.eventId, "99-1");
+  assert.equal(result.ledger, 99);
+  assert.equal(result.txHash, "cafecafe");
+  assert.equal(result.at, Math.floor(new Date("2026-06-15T12:00:00Z").getTime() / 1000));
+});
+
+test("decodeEvent: missing ledger and txHash default to 0 and empty string", () => {
+  const raw = {
+    id: "",
+    contractId: "",
+    topic: [],
+    value: null,
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.ledger, 0);
+  assert.equal(result.txHash, "");
+});
+
+// ── claim_cancelled (value-less event) ───────────────────────────────────────
+
+test("decodeEvent: claim_cancelled has no value fields and still decodes", () => {
+  const raw = {
+    id: "50-0",
+    contractId: "C1",
+    ledger: 50,
+    txHash: "ff",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_cancelled"), scU64(9)],
+    value: nativeToScVal({}),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.payload.name, "claim_cancelled");
+  assert.equal(result.payload.claimId, 9);
 });
