@@ -178,6 +178,12 @@ checks (default `http://127.0.0.1:8787`):
 | `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy; `503` when stopped or degraded (repeated RPC failures or a stale success window). |
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
+**Container Healthcheck:** A dedicated CLI probe is available for Docker `HEALTHCHECK` or Kubernetes `exec` probes. It reads the same environment variables and exits `0` on success:
+```bash
+npm run healthcheck
+# or: node dist/healthcheck.js
+```
+
 The JSON body is operational status only: poller counters, ledgers, truncated
 cursors, and whether a target has an error. It never includes `BOT_TOKEN`,
 chat ids, private keys, or unbounded remote payloads.
